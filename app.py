@@ -24,11 +24,13 @@ The front‑end is served from ``/`` and uses JavaScript to call these APIs.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, date
-from typing import Dict, List
 
-from flask import Flask, jsonify, request, abort, render_template
+from flask import Flask, jsonify, request, render_template
 from werkzeug.exceptions import Conflict, NotFound, BadRequest
+
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from config import Config
 from models import db, ClassRoom, Student, LessonSchedule, Attendance
@@ -49,12 +51,23 @@ def create_app() -> Flask:
     @app.before_first_request
     def create_tables() -> None:
         """Ensure all tables exist before handling the first request."""
-        db.create_all()
+        try:
+            db.create_all()
+        except SQLAlchemyError as exc:
+            # When the database is temporarily unavailable (e.g. during Heroku
+            # maintenance) the application should continue starting up instead
+            # of crashing. The health check endpoint will surface the failure.
+            app.logger.warning("Database unavailable during table creation: %s", exc)
 
     @app.route('/')
     def index() -> str:
         """Serve the single page front‑end."""
         return render_template('index.html')
+
+    @app.route('/health')
+    def healthcheck():
+        """Lightweight endpoint used by Heroku router health checks."""
+        return jsonify({'status': 'ok'}), 200
 
     # API: list of classes
     @app.route('/api/classes', methods=['GET'])
@@ -227,6 +240,13 @@ def create_app() -> Flask:
         response.status_code = error.code if isinstance(error, (BadRequest, NotFound, Conflict)) else 500
         return response
 
+    def handle_db_error(error):
+        app.logger.error("Database operation failed: %s", error)
+        return jsonify({'error': 'Database temporarily unavailable'}), 503
+
+    app.register_error_handler(OperationalError, handle_db_error)
+    app.register_error_handler(SQLAlchemyError, handle_db_error)
+
     return app
 
 
@@ -235,4 +255,5 @@ app = create_app()
 if __name__ == '__main__':
     # When run directly, start the development server. Gunicorn will be used
     # in production as per the Procfile recommendation:contentReference[oaicite:5]{index=5}.
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
