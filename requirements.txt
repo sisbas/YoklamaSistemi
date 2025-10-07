@@ -6,7 +6,9 @@
 # PostgreSQL driver:contentReference[oaicite:6]{index=6}.
 Flask==2.3.2
 Flask-SQLAlchemy==3.1.1
-SQLAlchemy==2.0.30
+# SQLAlchemy 2.0.30 is incompatible with Python 3.13 due to symbol() changes
+# raised during app start-up. Version 2.0.32 includes the upstream fix.
+SQLAlchemy==2.0.32
 psycopg2-binary==2.9.9
 gunicorn==21.2.0
 python-dotenv==1.0.1
