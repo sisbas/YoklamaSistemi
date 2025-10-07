@@ -255,5 +255,5 @@ app = create_app()
 if __name__ == '__main__':
     # When run directly, start the development server. Gunicorn will be used
     # in production as per the Procfile recommendation:contentReference[oaicite:5]{index=5}.
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port, debug=True)
