@@ -1,4 +1,0 @@
-# Specify the Python runtime for Heroku. Without this file Heroku may
-# default to an older version which can lead to incompatibilities.
-# Using Python 3.11 ensures support for modern language features.
-python-3.11.6
