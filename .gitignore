@@ -20,3 +20,8 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.sqlite3
+attendance.db
