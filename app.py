@@ -24,16 +24,30 @@ The front‑end is served from ``/`` and uses JavaScript to call these APIs.
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
+import time
+from collections import defaultdict, deque
 from datetime import datetime, date
+from typing import Deque, Dict
 
-from flask import Flask, jsonify, request, render_template
-from werkzeug.exceptions import Conflict, NotFound, BadRequest
-
+from flask import Flask, jsonify, render_template, request
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from werkzeug.exceptions import BadRequest, Conflict, HTTPException
 
+from app_logging import (
+    configure_logging,
+    get_logger,
+    get_request_id,
+    merge_request_context,
+    redact_sensitive_data,
+)
 from config import Config
-from models import db, ClassRoom, Student, LessonSchedule, Attendance
+from correlation_id_middleware import init_correlation_id
+from db_utils import retry_with_backoff
+from models import Attendance, ClassRoom, LessonSchedule, Student, db
+from request_logging_middleware import init_request_logging
 
 
 def create_app() -> Flask:
@@ -44,20 +58,50 @@ def create_app() -> Flask:
     default configuration comes from :class:`config.Config` and tables are
     created automatically on the first request if they do not exist.
     """
+    configure_logging()
+    logger = get_logger(__name__)
+
     app = Flask(__name__, template_folder='templates', static_folder='static')
     app.config.from_object(Config)
     db.init_app(app)
+    app.logger.handlers = []
+    app.logger.propagate = True
+
+    init_correlation_id(app)
+    init_request_logging(app)
+
+    # Lightweight in-memory rate limiter for the /client-logs endpoint.
+    client_log_events: Dict[str, Deque[float]] = defaultdict(deque)
+    client_log_lock = threading.Lock()
+    client_log_limit = int(os.environ.get('CLIENT_LOG_RATE_LIMIT', '10'))
+    client_log_window = int(os.environ.get('CLIENT_LOG_WINDOW_SECONDS', '60'))
 
     @app.before_first_request
     def create_tables() -> None:
         """Ensure all tables exist before handling the first request."""
         try:
-            db.create_all()
+            start = time.perf_counter()
+            retry_with_backoff(lambda: db.create_all())
+            duration = (time.perf_counter() - start) * 1000
+            logger.info(
+                "database_ready",
+                extra={"event": "database_ready", "duration_ms": round(duration, 2)},
+            )
+            app.config['DB_AVAILABLE'] = True
         except SQLAlchemyError as exc:
-            # When the database is temporarily unavailable (e.g. during Heroku
-            # maintenance) the application should continue starting up instead
-            # of crashing. The health check endpoint will surface the failure.
-            app.logger.warning("Database unavailable during table creation: %s", exc)
+            app.config['DB_AVAILABLE'] = False
+            logger.error(
+                "Database unavailable during table creation",
+                exc_info=exc,
+                extra={"event": "database_initialisation_failed"},
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            app.config['DB_AVAILABLE'] = False
+            logger.error(
+                "Unexpected error during table creation",
+                exc_info=exc,
+                extra={"event": "database_initialisation_failed"},
+            )
 
     @app.route('/')
     def index() -> str:
@@ -232,20 +276,102 @@ def create_app() -> Flask:
         return jsonify({'message': 'Attendance updated successfully'})
 
     # Generic error handlers to return JSON responses for API errors
-    @app.errorhandler(BadRequest)
-    @app.errorhandler(NotFound)
-    @app.errorhandler(Conflict)
-    def handle_error(error):
-        response = jsonify({'error': error.description})
-        response.status_code = error.code if isinstance(error, (BadRequest, NotFound, Conflict)) else 500
+    @app.route('/client-logs', methods=['POST'])
+    def ingest_client_logs():
+        """Accept structured logs from browser clients."""
+
+        payload = request.get_json(silent=True)
+        if payload is None or not isinstance(payload, dict):
+            raise BadRequest('JSON body required')
+
+        client_ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown')
+        if client_ip:
+            client_ip = client_ip.split(',')[0].strip()
+
+        now = time.time()
+        with client_log_lock:
+            bucket = client_log_events[client_ip]
+            while bucket and now - bucket[0] > client_log_window:
+                bucket.popleft()
+            if len(bucket) >= client_log_limit:
+                problem = _problem_response(
+                    status=429,
+                    title='Too Many Requests',
+                    detail='Rate limit exceeded for client logs',
+                )
+                return problem
+            bucket.append(now)
+
+        sanitized = redact_sensitive_data(payload)
+        merge_request_context(route='/client-logs')
+        get_logger('app.client_logs').info(
+            'client_log',
+            extra={
+                'event': 'client_log',
+                'client_ip': client_ip,
+                'client_payload': sanitized,
+                'user_agent': request.headers.get('User-Agent'),
+            },
+        )
+        return jsonify({'status': 'accepted', 'request_id': get_request_id()}), 202
+
+    def _problem_response(*, status: int, title: str, detail: str):
+        body = {
+            'title': title,
+            'status': status,
+            'detail': detail,
+            'request_id': get_request_id(),
+            'error': detail,
+        }
+        response = jsonify(body)
+        response.status_code = status
         return response
 
-    def handle_db_error(error):
-        app.logger.error("Database operation failed: %s", error)
-        return jsonify({'error': 'Database temporarily unavailable'}), 503
+    @app.errorhandler(HTTPException)
+    def handle_http_exception(error: HTTPException):
+        status = error.code or 500
+        detail = error.description if isinstance(error.description, str) else str(error)
+        title = error.name or 'HTTP Error'
+        log_level = logging.ERROR if status >= 500 else logging.WARNING
+        merge_request_context(status=status)
+        get_logger('app.errors').log(
+            log_level,
+            'http_exception',
+            extra={
+                'event': 'http_exception',
+                'error_type': error.__class__.__name__,
+                'status': status,
+                'detail': detail,
+            },
+        )
+        return _problem_response(status=status, title=title, detail=detail)
 
-    app.register_error_handler(OperationalError, handle_db_error)
-    app.register_error_handler(SQLAlchemyError, handle_db_error)
+    @app.errorhandler(Exception)
+    def handle_unexpected_exception(error: Exception):
+        if isinstance(error, OperationalError):
+            status = 503
+            detail = 'Database temporarily unavailable'
+            title = 'Service Unavailable'
+        elif isinstance(error, SQLAlchemyError):
+            status = 500
+            detail = 'Database error'
+            title = 'Internal Server Error'
+        else:
+            status = 500
+            detail = 'An unexpected error occurred.'
+            title = 'Internal Server Error'
+
+        merge_request_context(status=status)
+        get_logger('app.errors').error(
+            'unhandled_exception',
+            exc_info=error,
+            extra={
+                'event': 'unhandled_exception',
+                'error_type': error.__class__.__name__,
+                'detail': str(error),
+            },
+        )
+        return _problem_response(status=status, title=title, detail=detail)
 
     return app
 
